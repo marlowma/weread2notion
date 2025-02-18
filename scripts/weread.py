@@ -97,17 +97,68 @@ def get_review_list(bookId):
     return summary, reviews
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
+def find_existing_page(bookId):
+    """查找是否已存在对应的页面，如果存在则返回页面ID"""
     time.sleep(0.3)
     filter = {"property": "BookId", "rich_text": {"equals": bookId}}
     response = client.databases.query(database_id=database_id, filter=filter)
-    for result in response["results"]:
-        time.sleep(0.3)
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
+    if response["results"]:
+        return response["results"][0]["id"]
+    return None
+
+def update_notion_page(page_id, properties, icon):
+    """更新已存在的Notion页面，只更新微信读书相关的属性"""
+    time.sleep(0.3)
+    try:
+        # 获取当前页面的所有属性
+        current_page = client.pages.retrieve(page_id=page_id)
+        current_properties = current_page.get("properties", {})
+        
+        # 定义需要更新的属性（微信读书相关）
+        weread_properties = {
+            "BookName": properties.get("BookName"),
+            "BookId": properties.get("BookId"),
+            "ISBN": properties.get("ISBN"),
+            "URL": properties.get("URL"),
+            "Author": properties.get("Author"),
+            "Sort": properties.get("Sort"),
+            "Rating": properties.get("Rating"),
+            "Cover": properties.get("Cover"),
+            "Status": properties.get("Status"),
+            "ReadingTime": properties.get("ReadingTime"),
+            "Progress": properties.get("Progress"),
+            "Date": properties.get("Date"),
+            "Categories": properties.get("Categories")
+        }
+        
+        # 只更新存在的属性
+        update_properties = {}
+        for key, value in weread_properties.items():
+            if value is not None:  # 只更新有值的属性
+                update_properties[key] = value
+        
+        # 更新页面
+        client.pages.update(
+            page_id=page_id,
+            properties=update_properties,
+            icon=icon,
+            cover=icon
+        )
+        return page_id
+    except Exception as e:
+        print(f"更新页面时出错: {e}")
+        return None
+
+def clear_existing_blocks(page_id):
+    """清除页面中现有的内容块"""
+    time.sleep(0.3)
+    try:
+        response = client.blocks.children.list(block_id=page_id)
+        for block in response["results"]:
+            time.sleep(0.3)
+            client.blocks.delete(block_id=block["id"])
+    except Exception as e:
+        print(f"清除内容块时出错: {e}")
 
 
 def get_chapter_info(bookId):
@@ -124,54 +175,6 @@ def get_chapter_info(bookId):
         return {item["chapterUid"]: item for item in update}
     return None
 
-
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
-    time.sleep(0.3)
-    if not cover or not cover.startswith("http"):
-        cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"database_id": database_id, "type": "database_id"}
-    properties = {
-        "BookName": get_title(bookName),
-        "BookId": get_rich_text(bookId),
-        "ISBN": get_rich_text(isbn),
-        "URL": get_url(
-            f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}"
-        ),
-        "Author": get_rich_text(author),
-        "Sort": get_number(sort),
-        "Rating": get_number(rating),
-        "Cover": get_file(cover),
-    }
-    if categories != None:
-        properties["Categories"] = get_multi_select(categories)
-    read_info = get_read_info(bookId=bookId)
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        properties["Status"] = get_select("读完" if markedStatus == 4 else "在读")
-        properties["ReadingTime"] = get_rich_text(format_time)
-        properties["Progress"] = get_number(readingProgress)
-        if "finishedDate" in read_info:
-            properties["Date"] = get_date(
-                datetime.utcfromtimestamp(read_info.get("finishedDate")).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            )
-
-    icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
 
 
 def add_children(id, children):
@@ -435,11 +438,66 @@ if __name__ == "__main__":
             if categories != None:
                 categories = [x["title"] for x in categories]
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
+            # 查找已存在的页面
+            existing_page_id = find_existing_page(bookId)
             isbn, rating = get_bookinfo(bookId)
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
-            )
+            
+            # 准备页面属性
+            if not cover or not cover.startswith("http"):
+                cover = "https://www.notion.so/icons/book_gray.svg"
+            parent = {"database_id": database_id, "type": "database_id"}
+            properties = {
+                "BookName": get_title(title),
+                "BookId": get_rich_text(bookId),
+                "ISBN": get_rich_text(isbn),
+                "URL": get_url(
+                    f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}"
+                ),
+                "Author": get_rich_text(author),
+                "Sort": get_number(sort),
+                "Rating": get_number(rating),
+                "Cover": get_file(cover),
+            }
+            if categories != None:
+                properties["Categories"] = get_multi_select(categories)
+            
+            # 添加阅读信息
+            read_info = get_read_info(bookId=bookId)
+            if read_info != None:
+                markedStatus = read_info.get("markedStatus", 0)
+                readingTime = read_info.get("readingTime", 0)
+                readingProgress = read_info.get("readingProgress", 0)
+                format_time = ""
+                hour = readingTime // 3600
+            # print(cover)
+            # if book.get("author") == "公众号" and book.get("cover").endswith("/0"):
+                minutes = readingTime % 3600 // 60
+                if minutes > 0:
+                    format_time += f"{minutes}分"
+                properties["Status"] = get_select("读完" if markedStatus == 4 else "在读")
+                properties["ReadingTime"] = get_rich_text(format_time)
+                properties["Progress"] = get_number(readingProgress)
+                if "finishedDate" in read_info:
+                    properties["Date"] = get_date(
+                        datetime.utcfromtimestamp(read_info.get("finishedDate")).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                    )
+
+            icon = get_icon(cover)
+            
+            if existing_page_id:
+                # 如果页面已存在，更新页面属性和内容
+                print(f"更新已存在的页面: {title}")
+                id = update_notion_page(existing_page_id, properties, icon)
+                if id:
+                    print(f"清除并重写页面内容: {title}")
+                    clear_existing_blocks(id)
+            else:
+                # 如果页面不存在，创建新页面
+                print(f"创建新页面: {title}")
+                response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
+                id = response["id"]
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
             summary, reviews = get_review_list(bookId)
